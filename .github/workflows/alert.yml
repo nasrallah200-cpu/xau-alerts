@@ -1,0 +1,20 @@
+name: xau-alert
+on:
+  schedule:
+    - cron: "3,18,33,48 * * * 1-5"   # 3 min apres chaque quart d'heure (UTC), lundi-vendredi
+  workflow_dispatch: {}              # bouton "Run workflow" pour tester a la main
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas numpy requests
+      - run: python alert_bot.py
+        env:
+          TWELVE_KEY: ${{ secrets.TWELVE_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          INTERVAL: ${{ vars.INTERVAL || '15min' }}
