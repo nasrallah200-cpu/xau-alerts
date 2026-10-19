@@ -3,6 +3,10 @@ on:
   schedule:
     - cron: "3,18,33,48 * * * 1-5"   # 3 min apres chaque quart d'heure (UTC), lundi-vendredi
   workflow_dispatch: {}              # bouton "Run workflow" pour tester a la main
+# Serial execution protects the restored checkpoint from competing runs.
+concurrency:
+  group: xau-alert-state-v1
+  cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -12,9 +16,22 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install pandas numpy requests
+      - name: Restore alert checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: .alert-state
+          key: xau-alert-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            xau-alert-state-v1-
       - run: python alert_bot.py
         env:
           TWELVE_KEY: ${{ secrets.TWELVE_KEY }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
           INTERVAL: ${{ vars.INTERVAL || '15min' }}
+      - name: Save alert checkpoint
+        if: ${{ always() }}
+        uses: actions/cache/save@v4
+        with:
+          path: .alert-state
+          key: xau-alert-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
