@@ -5,7 +5,8 @@ Test sans envoi sur un CSV    : python alert_bot.py --test fichier.csv
 Variables d'environnement : TWELVE_KEY, TG_TOKEN, TG_CHAT
 DEMO / FORWARD TEST uniquement.
 """
-import os, sys
+import os, sys, json
+from pathlib import Path
 import numpy as np, pandas as pd, requests
 
 RR = 2.0
@@ -88,13 +89,67 @@ def message(df, sig, tf="H1"):
     tp = e + d * risk * RR
     return (f"{'BUY' if d == 1 else 'SELL'} XAUUSD {tf} (DEMO)\n"
             f"Bougie cloturee: {df['Date'].iloc[i]:%d/%m %H:%M} UTC\n"
-            f"Entree approx: {e:.2f} (open de la bougie suivante)\n"
+            f"Entree approx: {e:.2f} (cloture du signal; pas un prix garanti)\n"
             f"SL: {sl:.2f}\nTP (2R): {tp:.2f}\n"
             f"Si ton entree reelle differe: garde le SL, TP = entree {'+' if d == 1 else '-'} 2 x |entree - SL|.")
 
 def send(token, chat, text):
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                  data={"chat_id": chat, "text": text}, timeout=30).raise_for_status()
+    try:
+        response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                 data={"chat_id": chat, "text": text}, timeout=30)
+    except requests.RequestException:
+        raise RuntimeError("Telegram: echec reseau; resultat de livraison incertain") from None
+    if response.status_code != 200 or response.json().get("ok") is not True:
+        raise RuntimeError(f"Telegram: envoi refuse (HTTP {response.status_code})")
+
+
+def process_closed_bars(df, interval, now=None, notify=None, state_path=None):
+    """Catch up closed bars; cold start observes only newly closing bars."""
+    if df.empty:
+        raise RuntimeError("Twelve Data: aucune bougie cloturee")
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    bm = INTERVALS[interval]
+    tf = "H1" if bm == 60 else "M15"
+    path = Path(state_path or os.environ.get("ALERT_STATE", ".alert-state/state.json"))
+    state = json.loads(path.read_text()) if path.exists() else {"version": 1, "intervals": {}}
+    if state.get("version") != 1:
+        raise RuntimeError("Etat des alertes incompatible")
+    checkpoint = state["intervals"].get(interval)
+    # No replay of old trades on installation or cache loss.
+    cutoff = pd.Timestamp(checkpoint) if checkpoint else now - pd.Timedelta(minutes=14)
+    last_close = df["Date"].iloc[-1] + pd.Timedelta(minutes=bm)
+    if last_close <= cutoff:
+        print(f"Aucune nouvelle bougie cloturee; dernier controle {cutoff}")
+        return 0
+    if checkpoint and cutoff < df["Date"].iloc[0]:
+        raise RuntimeError("Historique insuffisant pour rattraper le dernier controle")
+    signals = {s[0]: s for s in find_signals(df, bm)}
+    count, checked = 0, 0
+    def save(close):
+        state["intervals"][interval] = close.isoformat()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, sort_keys=True))
+        tmp.replace(path)
+    for i in range(len(df)):
+        close = df["Date"].iloc[i] + pd.Timedelta(minutes=bm)
+        if not cutoff < close <= now:
+            continue
+        checked += 1
+        if i in signals:
+            delay = now - close
+            text = message(df, signals[i], tf)
+            if delay > pd.Timedelta(minutes=14):
+                text = (f"SIGNAL HISTORIQUE RETARDE de {int(delay.total_seconds() // 60)} min - "
+                        "INFORMATION UNIQUEMENT, PAS UNE ENTREE ACTUELLE\n" + text)
+            if notify is None:
+                send(os.environ["TG_TOKEN"], os.environ["TG_CHAT"], text)
+            else:
+                notify(text)
+            count += 1
+        save(close)
+    print(f"{len(df)} bougies, derniere {df['Date'].iloc[-1]}, {count} signal(s) envoye(s); {checked} nouvelle(s) bougie(s) controlee(s)")
+    return count
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--test":
@@ -109,12 +164,4 @@ if __name__ == "__main__":
     bm = INTERVALS[interval]
     tf = "H1" if bm == 60 else "M15"
     df = fetch(os.environ["TWELVE_KEY"], interval)
-    # n'alerter que si la derniere bougie vient de se cloturer (evite les doublons entre 2 passages)
-    age = pd.Timestamp.now(tz="UTC") - (df["Date"].iloc[-1] + pd.Timedelta(minutes=bm))
-    if age > pd.Timedelta(minutes=14):
-        print(f"derniere bougie cloturee il y a {age}: rien a envoyer a ce passage")
-        sys.exit()
-    sigs = [s for s in find_signals(df, bm) if s[0] == len(df) - 1]
-    for s in sigs:
-        send(os.environ["TG_TOKEN"], os.environ["TG_CHAT"], message(df, s, tf))
-    print(f"{len(df)} bougies, derniere {df['Date'].iloc[-1]}, {len(sigs)} signal(s) envoye(s)")
+    process_closed_bars(df, interval)
